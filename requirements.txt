@@ -1,0 +1,24 @@
+pip3 install 
+torch 
+torchvision 
+torchaudio 
+transformers 
+trl 
+wandb 
+bitsandbytes 
+sympy 
+latex2sympy2_extended 
+math_verify 
+pylatexenc 
+datasets
+deepspeed 
+peft
+vllm
+
+fsspec==2023.10.0 
+datasets==2.16.1 
+pyarrow==11.0.0
+
+
+
+
