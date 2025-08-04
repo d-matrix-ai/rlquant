@@ -107,8 +107,10 @@ def get_train_args(new_model_name, args):
         lr=0.0001
     training_args = GRPOConfig(
         output_dir=f"./{new_model_name}",
-        auto_find_batch_size=True,
-        gradient_accumulation_steps=2, # Added
+        # auto_find_batch_size=True,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=8, # Added
         max_prompt_length=int(args.max_prompt_length),
         max_completion_length=int(args.max_completion_length),
         gradient_checkpointing=args.gc,
@@ -117,7 +119,7 @@ def get_train_args(new_model_name, args):
         eval_steps=int(args.eval_steps),
         num_train_epochs=1,
         num_generations=8, 
-        save_total_limit=5,
+        save_total_limit=2,
         save_strategy='steps',
         eval_strategy='steps',
         max_grad_norm=1.0,
@@ -134,25 +136,21 @@ def get_train_args(new_model_name, args):
         warmup_steps=1,  # to get a training set baseline
         loss_type="grpo",
         eval_on_start=True,
-    )    
-# Do not use vllm if a. training with quantized model because of vllm issues with bnb/lora ; b. running large models because of added overhead when used with hf transformers
+    )
+    if args.adam8:
+        training_args.optim="adamw_8bit"
     if args.ft_done or not (args.quantize or args.gc or args.torch_oom):
         training_args.use_vllm = True
         training_args.vllm_mode="colocate"
         training_args.vllm_gpu_memory_utilization=0.35
     if args.drgrpo:
         training_args.scale_rewards = False
-    if args.adam8:
-        training_args.optim="adamw_8bit"
+
     return training_args
 
 
 def get_quant_config(qtype: str):
     match qtype:
-        case "8bit":
-            return BitsAndBytesConfig(
-                load_in_8bit=True,
-                )
         case "4bit":
             return BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -175,15 +173,34 @@ def quant_grad(grad:torch.Tensor) -> torch.Tensor:
     return grad_rup
 
 
+def fake_quantize(x):
+    qmin, qmax= -128.0, 127.0
+    max_val = x.abs().max()
+    scale = max_val / qmax
+    round_down = torch.round(x / scale).clamp(qmin, qmax)
+    round_up = round_down * scale
+    return round_up
+
+def quant_forward(module, input, output):
+    xq = fake_quantize(output)
+    if xq.requires_grad:
+        xq.register_hook(lambda grad: grad)
+    return xq
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("-q", "--quantize", action=argparse.BooleanOptionalAction, default=False, help="Enable quantize")
-    parser.add_argument("-mn", "--model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in model for finetuning")
-    parser.add_argument("-nmn", "--new-model-name", default=f"Qwen/Qwen3-4B-Base-ft", help="pass in model for finetuning")
+    
+    parser.add_argument("-mn", "--model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in model for finetuning")args.per_device_train_batch_size
+    parser.add_argument("-train-batch-size", "--per-device-train-batch-size", default=4, help="training batch size")
+    parser.add_argument("-eval-batch-size", "--per-device-eval-batch-size", default=4, help="evaluation batch size")
+    parser.add_argument("-bn", "--base-model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in base model for quantized evals")
+    parser.add_argument("-nmn", "--new-model-name", default=f"Qwen/Qwen3-0.6B-Base-ft", help="pass in model for finetuning")
     parser.add_argument("-qt", "--qtype", default="4bit", help="Type of quantization. Options: [4bit, 8bit, None]")
     parser.add_argument("-wp", "--wb-project", default="CatchAllProject", help="wandb project name")
-    parser.add_argument("-wr", "--wb-run-name", default="RunNameNotSpecified", help="wandb run name")
+    parser.add_argument("-wr", "--wb-run-name", default="Placeholder", help="wandb run name")
     parser.add_argument("-lenp", "--max-prompt-length", default=512, help="prompt length for finetuning")
     parser.add_argument("-lenc","--max-completion-length", default=512, help="completion length for finetuning")
     parser.add_argument("-log","--logging-steps", default=5, help="number of steps between each training log step")
@@ -203,7 +220,7 @@ def parse_arguments():
     parser.add_argument("-adpath", "--adapter-path", default="", help="Path to lora adapter")
     parser.add_argument("-ftd", "--ft-done", action=argparse.BooleanOptionalAction, default=False, help="Fine tuning done")
     parser.add_argument("-ptq", "--ptq", action=argparse.BooleanOptionalAction, default=False, help="Apply PTQ")
-    parser.add_argument("-ptq-type", "--ptq-type", default="bnb-4bit", help="Type of PTQ. Options currently supported: [bnb-4bit, bnb-8bit, gptq-2, gptq-4, gptq-8]")
+    parser.add_argument("-ptq-type", "--ptq-type", default="bnb-4bit", help="Type of PTQ. Options currently supported: [bnb-4bit, bnb-8bit, awq-4, awq-8]")
     parser.add_argument("-oom", "--torch-oom", action=argparse.BooleanOptionalAction, default=False, help="Set if you encounter torch cuda out of memory errors. Disables vllm.")
     parser.add_argument("-drgrpo", "--drgrpo", action=argparse.BooleanOptionalAction, default=False, help="Set for drgrpo evals")
 
@@ -230,20 +247,21 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
 
-    if args.quantize:
+    if args.quantize and args.qtype != "8bit":
         new_model_name= f"{new_model_name}-quant-{args.qtype}"
         quant_config = get_quant_config(args.qtype)
+        # Set device map to cpu for very large models.
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            device_map="cuda", 
             quantization_config=quant_config,
             trust_remote_code=True,
-            # device_map="cuda",
         )
 
         base_model.config.use_cache = False
         base_model.gradient_checkpointing_disable()
         if args.ft_done:
-            p_model = PeftModel.from_pretrained(base_model, args.adapter_path)
+            p_model = PeftModel.from_pretrained(base_model,args.adapter_path)
             model = p_model.merge_and_unload()
         else:
             base_model = prepare_model_for_kbit_training(base_model)
@@ -261,19 +279,31 @@ def main():
                 model = PeftModel.from_pretrained(
                         base_model,
                         args.adapter_path,
-                        # "Qwen/Qwen3-600M-Base-quant-4bit-genbatch32-gradacc2/checkpoint-460", #don't change w/o saving
-                        is_trainable=True,          
+                        is_trainable=True,
                     )
             else:
                 model = get_peft_model(base_model, loraconf)
-    else:
+    elif not args.quantize or args.qtype=="8bit":
+        # Set device map to cpu for very large models.
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            # device_map="auto", 
             trust_remote_code=True,
         )
 
     os.environ["WANDB_PROJECT"]=args.wb_project
 
+    if args.qtype=="8bit":
+        for module in model.modules():
+            if isinstance(module, torch.nn.Linear):
+                module.register_forward_hook(quant_forward)
+                
+    if args.quant_gradient:
+        assert args.qtype != "None" 
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.register_hook(quant_grad)
+    
     training_args = get_train_args(new_model_name, args)
 
     reward_fn = Reward(tokenizer, args.use_dense, False)
@@ -293,13 +323,6 @@ def main():
     print(f"Total parameters:     {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,} \n ({100 * trainable_params / total_params:.2f}% of total)")
 
-    if args.quant_gradient:
-        assert args.qtype != "None" 
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.register_hook(quant_grad)
-
-
     if args.resume_from_checkpoint:
         trainer.train(resume_from_checkpoint=True)
     else:
@@ -314,4 +337,3 @@ def main():
 
 if __name__=="__main__":
     main()
-

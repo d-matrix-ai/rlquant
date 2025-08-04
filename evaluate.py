@@ -30,6 +30,8 @@ from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 import torch.distributed as dist
 
+from awq_compress import compress_model
+
 class Collate_Fn():
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -56,28 +58,6 @@ def get_ptq_config(ptq_type: str, tokenizer=None, gptq_data=None):
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=torch.bfloat16
                 )
-        case "awq":
-            raise ValueError("Run awq_compress.py!")
-        case "gptq-2":
-            return GPTQConfig(
-                bits=2,
-                dataset=gptq_data,
-                tokenizer=tokenizer,
-            )
-        case "gptq-4":
-            return GPTQConfig(
-                bits=4,
-                dataset=gptq_data,
-                tokenizer=tokenizer,
-            )
-        case "gptq-8":
-            return GPTQConfig(
-                bits=8,
-                dataset=gptq_data,
-                tokenizer=tokenizer,
-            )
-        case "None":
-            return None
         case _ :
             raise Exception("incompatible post-training quantization type")
 
@@ -96,18 +76,32 @@ def main():
     _, eval_data = load_data_for_train_and_eval(args)
     os.environ["WANDB_PROJECT"]=args.wb_project
 
-
-    if args.ptq:
+    if args.ptq or args.quantize:
+        """Cannot use trainer with lora models, and awq faster with vllm."""
         reward_fn = Reward(tokenizer, False, True)
-        """For now only awq and bnb 4bit/8bit PTQ algorithms supported"""
-        if "awq" not in args.ptq_type:
+        print(f"\n\n\nargs.ptq_type = {args.ptq_type}\n\n\n", flush=True)
+        if args.ptq_type !="awq-4" and args.ptq_type !="awq-8":
+            
+            """Cannot use vllm with lora models -- unless merging adapter into model, which worsens performance. Can use this loop with awq, but takes longer."""
+
             accelerator=Accelerator()
-            quant_config = get_ptq_config(args.ptq_type)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=quant_config,
-                trust_remote_code=True,
-            )
+            if args.quantize:                             
+                quant_config = get_quant_config(args.qtype)         
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=quant_config,
+                    trust_remote_code=True,
+                )
+                base_model.config.use_cache = False
+                model = PeftModel.from_pretrained(base_model,args.adapter_path).to(device="cuda")
+                # model = p_model.merge_and_unload()
+            else:
+                quant_config = get_ptq_config(args.ptq_type)
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=quant_config,
+                    trust_remote_code=True,
+                )
             num_generations = 1
             batch_size = 32
             model.eval()
@@ -125,19 +119,18 @@ def main():
                 for prompts, inputs, answers in tqdm(dataloader):
                     inputs = {k: v.to(model.device) for k, v in inputs.items()}
                     all_generations_per_prompt = [[] for _ in range(len(prompts))]
-
-                    for _ in range(num_generations):
-                        with torch.no_grad():
-                            outputs = model.generate(
-                                **inputs,
-                                max_new_tokens=512,
-                                do_sample=True,
-                                temperature=1.0,
-                                top_p=1.0,
-                            )
-                        generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                        for i in range(len(prompts)):
-                            all_generations_per_prompt[i].append(generated_texts[i])
+                    
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=512,
+                            do_sample=True,
+                            temperature=1.0,
+                            top_p=1.0,
+                        )
+                    generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                    for i in range(len(prompts)):
+                        all_generations_per_prompt[i].append(generated_texts[i])
                 for prompt, gen, ref in zip(prompts, all_generations_per_prompt, answers):
                     gen_scores = reward_fn([prompt], gen, ans=[ref])
                     scores.append(gen_scores)
@@ -152,9 +145,12 @@ def main():
                 print(f"eval/reward: {np.mean(np.array(data))},\n eval/std: {np.std(np.array(data))}")
                 wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.array(data))})
             print("Evaluation done!")
+        
         else:
-            model = LLM(model_name, tensor_parallel_size=2)
-            # if dist.get_rank()==0:
+        
+            """vllm implementation for faster running."""
+            compressed_model= compress_model(args)
+            model = LLM(compressed_model)
             wandb.init(project=args.wb_project, name= args.wb_run_name)
             tasks_list = ["aime", "amc", "math", "minerva", "olympiad_bench"]
             data=[]
@@ -183,24 +179,12 @@ def main():
             wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.std(data))})
             print("Evaluation done!")
         return
-    elif args.quantize:                                      
-        quant_config = get_quant_config(args.ptq_type)         
-        base_model = AutoModelForCausalLM.from_pretrained(
+
+    model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="cuda", 
-            quantization_config=quant_config,
             trust_remote_code=True,
         )
-        base_model.config.use_cache = False
-        
-        p_model = PeftModel.from_pretrained(base_model,args.adapter_path)
-        model = p_model.merge_and_unload()
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="cuda", 
-                trust_remote_code=True,
-            )
+    
     reward_fn = Reward(tokenizer, False, False)
     training_args = GRPOConfig(
         output_dir=f"./{args.new_model_name}",
@@ -212,8 +196,8 @@ def main():
         use_vllm=False,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=0.35,
-        generation_batch_size=32, #Added                 --- try 64 as well.
-        gradient_accumulation_steps=2, # Added
+        generation_batch_size=32,
+        gradient_accumulation_steps=8,
         max_prompt_length=int(args.max_prompt_length),
         max_completion_length=int(args.max_completion_length),
         gradient_checkpointing=args.gc,
@@ -237,19 +221,16 @@ def main():
     )
     if args.adam8:
         training_args.optim="adamw_8bit"
+    
+    trainer = GRPOTrainer(
+        model=model,
+        args=training_args,
+        eval_dataset= eval_data,
+        processing_class=tokenizer,
+        reward_funcs=[reward_fn], 
+    )
 
-    if args.ptq and not args.quantize:
-        evaluate_model(model, tokenizer, eval_dataset, reward_fn, training_args)
-    else:
-        trainer = GRPOTrainer(
-            model=model,
-            args=training_args,
-            eval_dataset= eval_data,
-            processing_class=tokenizer,
-            reward_funcs=[reward_fn], 
-        )
-
-        trainer.evaluate()
+    trainer.evaluate()
 
 
 
