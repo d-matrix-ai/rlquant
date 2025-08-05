@@ -15,8 +15,6 @@ def compress_model(args):
 
     model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True,)
     args = parse_arguments()
-    NUM_CALIBRATION_SAMPLES = 128
-    MAX_SEQUENCE_LENGTH = 512
 
     train = load_from_disk("./datasets/train/math_12k")
     ds = train["train"].select(range(128))
@@ -36,7 +34,7 @@ def compress_model(args):
         return tokenizer(
             sample["text"],
             padding=False,
-            max_length=MAX_SEQUENCE_LENGTH,
+            max_length=512,
             add_special_tokens=False,
         )
 
@@ -45,7 +43,7 @@ def compress_model(args):
     else:
         recipe = [AWQModifier(ignore=["lm_head"], scheme="W4A16_ASYM", targets=["Linear"]),]
     
-    oneshot(model=model, dataset=ds, recipe=recipe, max_seq_length=MAX_SEQUENCE_LENGTH, num_calibration_samples=NUM_CALIBRATION_SAMPLES,)
+    oneshot(model=model, dataset=ds, recipe=recipe, max_seq_length=512, num_calibration_samples=128,)
     print("\n===========ONESHOT DONE===========\n")
 
     new_model_name = args.model_name + f"-{args.ptq_type}"

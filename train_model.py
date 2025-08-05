@@ -15,7 +15,6 @@ from peft import prepare_model_for_kbit_training
 from peft import LoraConfig, get_peft_model, PeftModel
 import torch
 
-# /home/ubuntu/.cache/huggingface/accelerate/default_config.yaml
 class Reward:
     def __init__(self, tokenizer, use_dense, evaluate):
         self.tokenizer = tokenizer
@@ -32,8 +31,6 @@ class Reward:
         logger.info(f"Completion: {completions}\n")
         logger.info(f"Answer: {answers}\n")
         scores = []
-        # Scores returns as an array of ({'formatted':True/False}, 0.0/1.0)
-        # We only need an array of the 1.0/0.0 floats for correctness
         for i in range(len(completions)):
             if len(answers)==1 and len(completions) > 1:
                 r = boxed_reward_fn(completions[i], answers[0])
@@ -43,13 +40,11 @@ class Reward:
                     scores.append(float(r[1]))
             elif i < len(answers):
                 if self.use_dense:
-                    # Problem with pseudo-dense rewards --- GRPO Trainer expects exactly the same value as tokenizer(completions[i]). Torch.tensor assumes
-                    # shortest length for all inputs -- only work around is 1 generation per prompt or overloading GPRO Trainer -- currently not worth it.
                     r = boxed_reward_fn(completions[i], answers[i])
                     ntokens = self.tokenizer(completions[i], return_tensors="pt")["input_ids"][0]
                     dense = [0.0] * len(ntokens)
                     if r[0]['formatted'] ==True:
-                        dense[-1] = float(r[1] + 0.1)  #Added offset to incentivize formatting (formatting and correctness are not independent)
+                        dense[-1] = float(r[1] + 0.1) 
                     else:
                         dense[-1] = float(r[1])
                     scores.append(dense)
@@ -107,10 +102,10 @@ def get_train_args(new_model_name, args):
         lr=0.0001
     training_args = GRPOConfig(
         output_dir=f"./{new_model_name}",
-        # auto_find_batch_size=True,
+        # auto_find_batch_size=True,        --- can't use with deepspeed 3
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=8, # Added
+        gradient_accumulation_steps=8,
         max_prompt_length=int(args.max_prompt_length),
         max_completion_length=int(args.max_completion_length),
         gradient_checkpointing=args.gc,
@@ -133,7 +128,7 @@ def get_train_args(new_model_name, args):
         temperature=1, 
         lr_scheduler_type = "linear",
         logging_first_step=True,
-        warmup_steps=1,  # to get a training set baseline
+        warmup_steps=1,
         loss_type="grpo",
         eval_on_start=True,
     )
@@ -193,11 +188,11 @@ def parse_arguments():
 
     parser.add_argument("-q", "--quantize", action=argparse.BooleanOptionalAction, default=False, help="Enable quantize")
     
-    parser.add_argument("-mn", "--model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in model for finetuning")args.per_device_train_batch_size
+    parser.add_argument("-mn", "--model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in model for finetuning")
     parser.add_argument("-train-batch-size", "--per-device-train-batch-size", default=4, help="training batch size")
     parser.add_argument("-eval-batch-size", "--per-device-eval-batch-size", default=4, help="evaluation batch size")
     parser.add_argument("-bn", "--base-model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in base model for quantized evals")
-    parser.add_argument("-nmn", "--new-model-name", default=f"Qwen/Qwen3-0.6B-Base-ft", help="pass in model for finetuning")
+    parser.add_argument("-nmn", "--new-model-name", default=f"Qwen3-0.6B-Base-ft", help="pass in model for finetuning")
     parser.add_argument("-qt", "--qtype", default="4bit", help="Type of quantization. Options: [4bit, 8bit, None]")
     parser.add_argument("-wp", "--wb-project", default="CatchAllProject", help="wandb project name")
     parser.add_argument("-wr", "--wb-run-name", default="Placeholder", help="wandb run name")
@@ -218,7 +213,6 @@ def parse_arguments():
     parser.add_argument("-ad8", "--adam8", action=argparse.BooleanOptionalAction, default=False, help="use adam 8bit")
     parser.add_argument("-grad8", "--quant-gradient", action=argparse.BooleanOptionalAction, default=False, help="use 8bit gradient casting (fake quantization)")
     parser.add_argument("-adpath", "--adapter-path", default="", help="Path to lora adapter")
-    parser.add_argument("-ftd", "--ft-done", action=argparse.BooleanOptionalAction, default=False, help="Fine tuning done")
     parser.add_argument("-ptq", "--ptq", action=argparse.BooleanOptionalAction, default=False, help="Apply PTQ")
     parser.add_argument("-ptq-type", "--ptq-type", default="bnb-4bit", help="Type of PTQ. Options currently supported: [bnb-4bit, bnb-8bit, awq-4, awq-8]")
     parser.add_argument("-oom", "--torch-oom", action=argparse.BooleanOptionalAction, default=False, help="Set if you encounter torch cuda out of memory errors. Disables vllm.")
@@ -248,6 +242,7 @@ def main():
     tokenizer.padding_side = 'left'
 
     if args.quantize and args.qtype != "8bit":
+        """If 4bit quantized we need to add lora adapter"""
         new_model_name= f"{new_model_name}-quant-{args.qtype}"
         quant_config = get_quant_config(args.qtype)
         # Set device map to cpu for very large models.
@@ -257,33 +252,28 @@ def main():
             quantization_config=quant_config,
             trust_remote_code=True,
         )
-
         base_model.config.use_cache = False
-        base_model.gradient_checkpointing_disable()
-        if args.ft_done:
-            p_model = PeftModel.from_pretrained(base_model,args.adapter_path)
-            model = p_model.merge_and_unload()
+        base_model = prepare_model_for_kbit_training(base_model)
+        base_model.gradient_checkpointing_disable()  
+        loraconf = LoraConfig(
+                    r=8,
+                    lora_alpha=16, 
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], 
+                    exclude_modules=["lm_head"],
+                    lora_dropout=0.05, 
+                    bias="none", 
+                    task_type="CAUSAL_LM"
+                )
+        if args.resume_from_checkpoint:
+            model = PeftModel.from_pretrained(
+                    base_model,
+                    args.adapter_path,
+                    is_trainable=True,
+                )
         else:
-            base_model = prepare_model_for_kbit_training(base_model)
-            base_model.gradient_checkpointing_disable()  
-            loraconf = LoraConfig(
-                        r=8,
-                        lora_alpha=16, 
-                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], 
-                        exclude_modules=["lm_head"],
-                        lora_dropout=0.05, 
-                        bias="none", 
-                        task_type="CAUSAL_LM"
-                    )
-            if args.resume_from_checkpoint:
-                model = PeftModel.from_pretrained(
-                        base_model,
-                        args.adapter_path,
-                        is_trainable=True,
-                    )
-            else:
-                model = get_peft_model(base_model, loraconf)
-    elif not args.quantize or args.qtype=="8bit":
+            model = get_peft_model(base_model, loraconf)
+    else:
+        """Load model as usual for supervised ft or 8bit quantized ft"""
         # Set device map to cpu for very large models.
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
