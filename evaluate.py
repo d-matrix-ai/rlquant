@@ -61,6 +61,79 @@ def get_ptq_config(ptq_type: str, tokenizer=None, gptq_data=None):
         case _ :
             raise Exception("incompatible post-training quantization type")
 
+
+def accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data):
+    accelerator=Accelerator()
+    if args.quantize:                             
+        quant_config = get_quant_config(args.qtype)         
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quant_config,
+            trust_remote_code=True,
+        )
+        base_model.config.use_cache = False
+        model = PeftModel.from_pretrained(base_model,args.adapter_path).to(device="cuda")
+        # model = p_model.merge_and_unload()
+    elif args.ptq:
+        quant_config = get_ptq_config(args.ptq_type)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quant_config,
+            trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
+    model.eval()
+    
+    AcceleratorState().deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 8
+    
+    if accelerator.is_main_process:
+        wandb.init(project=args.wb_project, name= args.wb_run_name)
+    
+    tasks_list = ["aime", "amc", "math", "minerva", "olympiad_bench"]
+    data = []
+    print("Beginning eval cycle")
+    collate_fn = Collate_Fn(tokenizer)
+    for task in tasks_list:
+        dataloader = DataLoader(eval_data[task], batch_size=32, shuffle=True, collate_fn=collate_fn)
+        dataloader = accelerator.prepare(dataloader)
+        scores = []
+        for prompts, inputs, answers in tqdm(dataloader):
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            all_generations_per_prompt = [[] for _ in range(len(prompts))]
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    do_sample=True,
+                    temperature=1.0,
+                    top_p=1.0,
+                )
+            generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            for i in range(len(prompts)):
+                all_generations_per_prompt[i].append(generated_texts[i])
+        
+        for prompt, gen, ref in zip(prompts, all_generations_per_prompt, answers):
+            gen_scores = reward_fn([prompt], gen, ans=[ref])
+            scores.append(gen_scores) 
+        all_scores = accelerator.gather_for_metrics(scores)
+        data.append(all_scores)
+        mean_reward = np.mean(np.array(all_scores))
+        mean_stdev = np.std(np.array(all_scores))
+        if accelerator.is_main_process:
+            print(f"eval/reward_{task}: {mean_reward},\n eval/std_{task}: {mean_stdev}")
+            wandb.log({"task": task, f"eval/reward_{task}": mean_reward, f"eval/std_{task}": mean_stdev})
+    if accelerator.is_main_process:
+        print(f"eval/reward: {np.mean(np.array(data))},\n eval/std: {np.std(np.array(data))}")
+        wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.array(data))})
+    print("Evaluation done!")
+    
+
+
 def main():
     args = parse_arguments()
 
@@ -76,161 +149,50 @@ def main():
     _, eval_data = load_data_for_train_and_eval(args)
     os.environ["WANDB_PROJECT"]=args.wb_project
 
-    if args.ptq or args.quantize:
-        """Cannot use trainer with lora models, and awq faster with vllm."""
-        reward_fn = Reward(tokenizer, False, True)
-        print(f"\n\n\nargs.ptq_type = {args.ptq_type}\n\n\n", flush=True)
-        if args.ptq_type !="awq-4" and args.ptq_type !="awq-8":
-            
-            """Cannot use vllm with lora models -- unless merging adapter into model, which worsens performance. Can use this loop with awq, but takes longer."""
-
-            accelerator=Accelerator()
-            if args.quantize:                             
-                quant_config = get_quant_config(args.qtype)         
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    quantization_config=quant_config,
-                    trust_remote_code=True,
-                )
-                base_model.config.use_cache = False
-                model = PeftModel.from_pretrained(base_model,args.adapter_path).to(device="cuda")
-                # model = p_model.merge_and_unload()
-            else:
-                quant_config = get_ptq_config(args.ptq_type)
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    quantization_config=quant_config,
-                    trust_remote_code=True,
-                )
-            num_generations = 1
-            batch_size = 32
-            model.eval()
-            AcceleratorState().deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 8
-            if accelerator.is_main_process:
-                wandb.init(project=args.wb_project, name= args.wb_run_name)
-            tasks_list = ["aime", "amc", "math", "minerva", "olympiad_bench"]
-            data = []
-            print("Beginning eval cycle")
-            collate_fn = Collate_Fn(tokenizer)
-            for task in tasks_list:
-                dataloader = DataLoader(eval_data[task], batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-                dataloader = accelerator.prepare(dataloader)
-                scores = []
-                for prompts, inputs, answers in tqdm(dataloader):
-                    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-                    all_generations_per_prompt = [[] for _ in range(len(prompts))]
-                    
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=512,
-                            do_sample=True,
-                            temperature=1.0,
-                            top_p=1.0,
-                        )
-                    generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                    for i in range(len(prompts)):
-                        all_generations_per_prompt[i].append(generated_texts[i])
-                for prompt, gen, ref in zip(prompts, all_generations_per_prompt, answers):
-                    gen_scores = reward_fn([prompt], gen, ans=[ref])
-                    scores.append(gen_scores)
-                all_scores = accelerator.gather_for_metrics(scores)
-                data.append(all_scores)
-                mean_reward = np.mean(np.array(all_scores))
-                mean_stdev = np.std(np.array(all_scores))
-                if accelerator.is_main_process:
-                    print(f"eval/reward_{task}: {mean_reward},\n eval/std_{task}: {mean_stdev}")
-                    wandb.log({"task": task, f"eval/reward_{task}": mean_reward, f"eval/std_{task}": mean_stdev})
-            if accelerator.is_main_process:
-                print(f"eval/reward: {np.mean(np.array(data))},\n eval/std: {np.std(np.array(data))}")
-                wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.array(data))})
-            print("Evaluation done!")
-        
-        else:
-        
-            """vllm implementation for faster running."""
+    """Cannot use trainer with lora models, and evaluation is faster with vllm."""
+    reward_fn = Reward(tokenizer, False, True)
+    if (args.ptq and args.ptq_type !="awq-4" and args.ptq_type !="awq-8") or args.quantize:
+        """Cannot use vllm with lora models -- unless merging adapter into model, which worsens performance. Can use this with awq, but takes longer."""
+        """When using accelerate launch script with `accelerate launch evaluate.py ...` """
+        accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data)
+    else:
+        """When using vllm launch script with python evaluate.py ..."""
+        print("=====================IN ELSE==============================")
+        if args.ptq:
             compressed_model= compress_model(args)
             model = LLM(compressed_model)
-            wandb.init(project=args.wb_project, name= args.wb_run_name)
-            tasks_list = ["aime", "amc", "math", "minerva", "olympiad_bench"]
-            data=[]
-            for task in tasks_list:
-                e_data = eval_data[task]
-                inputs = []
-                answers = []
-                for item in e_data:
-                    inputs.append(item["problem"])
-                    answers.append(item["answer"])
-                sampling_params = SamplingParams(temperature=1.0,top_p=1.0, max_tokens=512)
-                outputs = model.generate(inputs, sampling_params)
-                scores = []
-                for i, output in enumerate(outputs):
-                    generated_text = output.outputs[0].text
-                    prompt = inputs[i]
-                    ref = answers[i]
-                    score = reward_fn([prompt], [generated_text], ans=[ref])
-                    scores.append(score)
-                data.extend(scores)
-                mean_reward = np.mean(np.array(scores))
-                mean_stdev = np.std(np.array(scores))
-                print(f"eval/reward_{task}: {mean_reward},\n eval/std_{task}: {mean_stdev}")
-                wandb.log({"task": task, f"eval/reward_{task}": mean_reward, f"eval/std_{task}": mean_stdev})            
-            print(f"eval/reward: {np.mean(np.array(data))},\n eval/std: {np.std(np.array(data))}")
-            wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.std(data))})
-            print("Evaluation done!")
-        return
-
-    model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-        )
-    
-    reward_fn = Reward(tokenizer, False, False)
-    training_args = GRPOConfig(
-        output_dir=f"./{args.new_model_name}",
-        report_to="wandb",
-        run_name=args.wb_run_name,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        bf16=True,
-        use_vllm=False,
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.35,
-        generation_batch_size=32,
-        gradient_accumulation_steps=8,
-        max_prompt_length=int(args.max_prompt_length),
-        max_completion_length=int(args.max_completion_length),
-        gradient_checkpointing=args.gc,
-        logging_steps=1,
-        eval_steps=1,
-        num_train_epochs=1,
-        num_generations=8, 
-        save_total_limit=5,
-        save_strategy='steps',
-        eval_strategy='steps',
-        max_grad_norm=1.0,
-        beta=0,
-        remove_unused_columns=False, 
-        save_steps=20,
-        top_p=1,
-        temperature=1, 
-        logging_first_step=True,
-        loss_type="grpo",
-        eval_on_start=True,
-        do_train=False,
-    )
-    if args.adam8:
-        training_args.optim="adamw_8bit"
-    
-    trainer = GRPOTrainer(
-        model=model,
-        args=training_args,
-        eval_dataset= eval_data,
-        processing_class=tokenizer,
-        reward_funcs=[reward_fn], 
-    )
-
-    trainer.evaluate()
+        else:
+            print("=====================IN LOAD LLM==============================")
+            model = LLM(args.model_name)
+        
+        print("=====================MODEL LOADED==============================")
+        wandb.init(project=args.wb_project, name= args.wb_run_name)
+        tasks_list = ["aime", "amc", "math", "minerva", "olympiad_bench"]
+        data=[]
+        for task in tasks_list:
+            e_data = eval_data[task]
+            inputs = []
+            answers = []
+            for item in e_data:
+                inputs.append(item["problem"])
+                answers.append(item["answer"])
+            sampling_params = SamplingParams(temperature=1.0,top_p=1.0, max_tokens=512)
+            outputs = model.generate(inputs, sampling_params)
+            scores = []
+            for i, output in enumerate(outputs):
+                generated_text = output.outputs[0].text
+                prompt = inputs[i]
+                ref = answers[i]
+                score = reward_fn([prompt], [generated_text], ans=[ref])
+                scores.append(score)
+            data.extend(scores)
+            mean_reward = np.mean(np.array(scores))
+            mean_stdev = np.std(np.array(scores))
+            print(f"eval/reward_{task}: {mean_reward},\n eval/std_{task}: {mean_stdev}")
+            wandb.log({"task": task, f"eval/reward_{task}": mean_reward, f"eval/std_{task}": mean_stdev})            
+        print(f"eval/reward: {np.mean(np.array(data))},\n eval/std: {np.std(np.array(data))}")
+        wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.std(data))})
+        print("Evaluation done!")
 
 
 

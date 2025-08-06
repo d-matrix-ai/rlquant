@@ -15,6 +15,9 @@ from peft import prepare_model_for_kbit_training
 from peft import LoraConfig, get_peft_model, PeftModel
 import torch
 
+from module import QuantizedLinear
+
+
 class Reward:
     def __init__(self, tokenizer, use_dense, evaluate):
         self.tokenizer = tokenizer
@@ -98,7 +101,7 @@ def load_data_for_train_and_eval(args):
 
 def get_train_args(new_model_name, args):
     lr = 0.000001
-    if args.quantize:
+    if args.quantize and not args.qtype =="8bit":
         lr=0.0001
     training_args = GRPOConfig(
         output_dir=f"./{new_model_name}",
@@ -134,7 +137,7 @@ def get_train_args(new_model_name, args):
     )
     if args.adam8:
         training_args.optim="adamw_8bit"
-    if args.ft_done or not (args.quantize or args.gc or args.torch_oom):
+    if not (args.quantize or args.gc or args.torch_oom):
         training_args.use_vllm = True
         training_args.vllm_mode="colocate"
         training_args.vllm_gpu_memory_utilization=0.35
@@ -171,10 +174,10 @@ def quant_grad(grad:torch.Tensor) -> torch.Tensor:
 def fake_quantize(x):
     qmin, qmax= -128.0, 127.0
     max_val = x.abs().max()
-    scale = max_val / qmax
-    round_down = torch.round(x / scale).clamp(qmin, qmax)
-    round_up = round_down * scale
-    return round_up
+    if max_val == 0.0:
+        return x
+    scale = torch.clamp(max_val / qmax, min=1e-6)
+    return torch.round(x / scale).clamp(qmin, qmax) * scale
 
 def quant_forward(module, input, output):
     xq = fake_quantize(output)
@@ -287,6 +290,16 @@ def main():
         for module in model.modules():
             if isinstance(module, torch.nn.Linear):
                 module.register_forward_hook(quant_forward)
+        # for name, module in model.named_modules():
+        #     if isinstance(module, QuantizedLinear):
+        #         continue
+        #     for child_name, child in module.named_children():
+        #         if isinstance(child, torch.nn.Linear):
+        #             ql = QuantizedLinear(child.in_features, child.out_features, bias=(child.bias is not None))
+        #             with torch.no_grad():
+        #                 ql.load_weights(child)
+        #             setattr(module, child_name, ql)
+        
                 
     if args.quant_gradient:
         assert args.qtype != "None" 
