@@ -171,21 +171,6 @@ def quant_grad(grad:torch.Tensor) -> torch.Tensor:
     return grad_rup
 
 
-def fake_quantize(x):
-    qmin, qmax= -128.0, 127.0
-    max_val = x.abs().max()
-    if max_val == 0.0:
-        return x
-    scale = torch.clamp(max_val / qmax, min=1e-6)
-    return torch.round(x / scale).clamp(qmin, qmax) * scale
-
-def quant_forward(module, input, output):
-    xq = fake_quantize(output)
-    if xq.requires_grad:
-        xq.register_hook(lambda grad: grad)
-    return xq
-
-
 def parse_arguments():
     parser = argparse.ArgumentParser()
 
