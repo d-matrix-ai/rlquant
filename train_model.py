@@ -248,7 +248,7 @@ def main():
         """If 4bit quantized we need to add lora adapter"""
         new_model_name= f"{new_model_name}-quant-{args.qtype}"
         quant_config = get_quant_config(args.qtype)
-        # Set device map to cpu for very large models.
+        # Set device map to cpu for very large models. -- do NOT use with deepspeed 3 ; will get attribute/dtensor errors
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map="cuda", 
@@ -287,18 +287,17 @@ def main():
     os.environ["WANDB_PROJECT"]=args.wb_project
 
     if args.qtype=="8bit":
-        for module in model.modules():
-            if isinstance(module, torch.nn.Linear):
-                module.register_forward_hook(quant_forward)
-        # for name, module in model.named_modules():
-        #     if isinstance(module, QuantizedLinear):
-        #         continue
-        #     for child_name, child in module.named_children():
-        #         if isinstance(child, torch.nn.Linear):
-        #             ql = QuantizedLinear(child.in_features, child.out_features, bias=(child.bias is not None))
-        #             with torch.no_grad():
-        #                 ql.load_weights(child)
-        #             setattr(module, child_name, ql)
+        for name, module in model.named_modules():
+            if isinstance(module, QuantizedLinear):
+                continue
+            for child_name, child in module.named_children():
+                if child_name=="lm_head":
+                    continue
+                if isinstance(child, torch.nn.Linear):
+                    ql = QuantizedLinear(child.in_features, child.out_features, bias=(child.bias is not None))
+                    with torch.no_grad():
+                        ql.load_weights(child)
+                    setattr(module, child_name, ql)
         
                 
     if args.quant_gradient:
