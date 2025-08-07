@@ -74,18 +74,25 @@ def accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data):
         base_model.config.use_cache = False
         model = PeftModel.from_pretrained(base_model,args.adapter_path).to(device="cuda")
         # model = p_model.merge_and_unload()
+<<<<<<< HEAD
     elif args.ptq:
+=======
+    else:
+>>>>>>> main
         quant_config = get_ptq_config(args.ptq_type)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quant_config,
             trust_remote_code=True,
         )
+<<<<<<< HEAD
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             trust_remote_code=True,
         )
+=======
+>>>>>>> main
     model.eval()
     
     AcceleratorState().deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 8
@@ -147,6 +154,7 @@ def main():
     if args.evaluate:
         args.train_dataset=""
     _, eval_data = load_data_for_train_and_eval(args)
+    
     os.environ["WANDB_PROJECT"]=args.wb_project
 
     """Cannot use trainer with lora models, and evaluation is faster with vllm."""
