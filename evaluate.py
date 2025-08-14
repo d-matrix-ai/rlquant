@@ -3,6 +3,7 @@ import argparse
 
 from datasets import load_from_disk
 from datasets import DatasetDict
+from datasets import load_dataset
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer 
@@ -64,38 +65,33 @@ def get_ptq_config(ptq_type: str, tokenizer=None, gptq_data=None):
 
 def accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data):
     accelerator=Accelerator()
-    if args.quantize:                             
+    if args.quantize and args.qtype != "8bit":                             
         quant_config = get_quant_config(args.qtype)         
-        base_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
             quantization_config=quant_config,
             trust_remote_code=True,
+            # device_map = "cpu"
         )
-        base_model.config.use_cache = False
-        model = PeftModel.from_pretrained(base_model,args.adapter_path).to(device="cuda")
-        # model = p_model.merge_and_unload()
-<<<<<<< HEAD
     elif args.ptq:
-=======
-    else:
->>>>>>> main
         quant_config = get_ptq_config(args.ptq_type)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quant_config,
             trust_remote_code=True,
+            # device_map = "cuda"
         )
-<<<<<<< HEAD
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            # device_map = "cpu"
             trust_remote_code=True,
         )
-=======
->>>>>>> main
     model.eval()
     
     AcceleratorState().deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 8
+    if args.qtype == "8bit":
+        model = accelerator.prepare(model)
     
     if accelerator.is_main_process:
         wandb.init(project=args.wb_project, name= args.wb_run_name)
@@ -116,8 +112,8 @@ def accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data):
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=512,
-                    do_sample=True,
-                    temperature=1.0,
+                    do_sample=False,
+                    # temperature=0.0,
                     top_p=1.0,
                 )
             generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -146,6 +142,8 @@ def main():
 
     model_name = (args.base_model_name if args.quantize else args.model_name)
     adpath = args.adapter_path
+
+    print(f"MODEL NAME = {model_name}")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -158,7 +156,7 @@ def main():
     os.environ["WANDB_PROJECT"]=args.wb_project
 
     """Cannot use trainer with lora models, and evaluation is faster with vllm."""
-    reward_fn = Reward(tokenizer, False, True)
+    reward_fn = Reward(tokenizer, True)
     if (args.ptq and args.ptq_type !="awq-4" and args.ptq_type !="awq-8") or args.quantize:
         """Cannot use vllm with lora models -- unless merging adapter into model, which worsens performance. Can use this with awq, but takes longer."""
         """When using accelerate launch script with `accelerate launch evaluate.py ...` """
@@ -184,7 +182,7 @@ def main():
             for item in e_data:
                 inputs.append(item["problem"])
                 answers.append(item["answer"])
-            sampling_params = SamplingParams(temperature=1.0,top_p=1.0, max_tokens=512)
+            sampling_params = SamplingParams(temperature=0.0,top_p=1.0, max_tokens=512)
             outputs = model.generate(inputs, sampling_params)
             scores = []
             for i, output in enumerate(outputs):
