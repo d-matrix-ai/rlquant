@@ -15,10 +15,12 @@ from peft import prepare_model_for_kbit_training
 from peft import LoraConfig, get_peft_model, PeftModel
 import torch
 
+from module import QuantizedLinear
+
+
 class Reward:
-    def __init__(self, tokenizer, use_dense, evaluate):
+    def __init__(self, tokenizer, evaluate):
         self.tokenizer = tokenizer
-        self.use_dense = use_dense
         self.ptq_evaluate = evaluate
     
     @property
@@ -39,21 +41,11 @@ class Reward:
                 else:
                     scores.append(float(r[1]))
             elif i < len(answers):
-                if self.use_dense:
-                    r = boxed_reward_fn(completions[i], answers[i])
-                    ntokens = self.tokenizer(completions[i], return_tensors="pt")["input_ids"][0]
-                    dense = [0.0] * len(ntokens)
-                    if r[0]['formatted'] ==True:
-                        dense[-1] = float(r[1] + 0.1) 
-                    else:
-                        dense[-1] = float(r[1])
-                    scores.append(dense)
+                r = boxed_reward_fn(completions[i], answers[i])
+                if r[0]['formatted']==True:
+                    scores.append(float(r[1] + 0.1))
                 else:
-                    r = boxed_reward_fn(completions[i], answers[i])
-                    if r[0]['formatted']==True:
-                        scores.append(float(r[1] + 0.1))
-                    else:
-                        scores.append(float(r[1]))
+                    scores.append(float(r[1]))
         return scores
 
 
@@ -98,14 +90,13 @@ def load_data_for_train_and_eval(args):
 
 def get_train_args(new_model_name, args):
     lr = 0.000001
-    if args.quantize:
+    if args.quantize and not args.qtype =="8bit":
         lr=0.0001
     training_args = GRPOConfig(
         output_dir=f"./{new_model_name}",
-        # auto_find_batch_size=True,        --- can't use with deepspeed 3
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=16,
         max_prompt_length=int(args.max_prompt_length),
         max_completion_length=int(args.max_completion_length),
         gradient_checkpointing=args.gc,
@@ -113,7 +104,7 @@ def get_train_args(new_model_name, args):
         logging_steps=int(args.logging_steps),
         eval_steps=int(args.eval_steps),
         num_train_epochs=1,
-        num_generations=8, 
+        num_generations=4, 
         save_total_limit=2,
         save_strategy='steps',
         eval_strategy='steps',
@@ -134,7 +125,7 @@ def get_train_args(new_model_name, args):
     )
     if args.adam8:
         training_args.optim="adamw_8bit"
-    if args.ft_done or not (args.quantize or args.gc or args.torch_oom):
+    if not (args.quantize or args.gc or args.torch_oom):
         training_args.use_vllm = True
         training_args.vllm_mode="colocate"
         training_args.vllm_gpu_memory_utilization=0.35
@@ -153,7 +144,7 @@ def get_quant_config(qtype: str):
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=torch.bfloat16
                 )
-        case "None":
+        case _ :
             return None
 
 
@@ -168,31 +159,16 @@ def quant_grad(grad:torch.Tensor) -> torch.Tensor:
     return grad_rup
 
 
-def fake_quantize(x):
-    qmin, qmax= -128.0, 127.0
-    max_val = x.abs().max()
-    scale = max_val / qmax
-    round_down = torch.round(x / scale).clamp(qmin, qmax)
-    round_up = round_down * scale
-    return round_up
-
-def quant_forward(module, input, output):
-    xq = fake_quantize(output)
-    if xq.requires_grad:
-        xq.register_hook(lambda grad: grad)
-    return xq
-
-
 def parse_arguments():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("-q", "--quantize", action=argparse.BooleanOptionalAction, default=False, help="Enable quantize")
     
-    parser.add_argument("-mn", "--model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in model for finetuning")
-    parser.add_argument("-train-batch-size", "--per-device-train-batch-size", default=4, help="training batch size")
-    parser.add_argument("-eval-batch-size", "--per-device-eval-batch-size", default=4, help="evaluation batch size")
-    parser.add_argument("-bn", "--base-model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in base model for quantized evals")
-    parser.add_argument("-nmn", "--new-model-name", default=f"Qwen3-0.6B-Base-ft", help="pass in model for finetuning")
+    parser.add_argument("-mn", "--model-name", default="", help="pass in model for finetuning")
+    parser.add_argument("-train-batch-size", "--per-device-train-batch-size", default=2, help="training batch size")
+    parser.add_argument("-eval-batch-size", "--per-device-eval-batch-size", default=2, help="evaluation batch size")
+    parser.add_argument("-bn", "--base-model-name", default="", help="pass in base model for quantized evals")
+    parser.add_argument("-nmn", "--new-model-name", default="", help="pass in model for finetuning")
     parser.add_argument("-qt", "--qtype", default="4bit", help="Type of quantization. Options: [4bit, 8bit, None]")
     parser.add_argument("-wp", "--wb-project", default="CatchAllProject", help="wandb project name")
     parser.add_argument("-wr", "--wb-run-name", default="Placeholder", help="wandb run name")
@@ -209,7 +185,6 @@ def parse_arguments():
     parser.add_argument("-save", "--save-steps", default=20, help="Number of steps after which to save model checkpoint")
     parser.add_argument("-qm", "--qwen-math", action=argparse.BooleanOptionalAction, default=False, help="Apply qwen math format")
     parser.add_argument("-g", "--gc", action=argparse.BooleanOptionalAction, default=False, help="use gradient checkpointing")
-    parser.add_argument("-ud", "--use-dense", action=argparse.BooleanOptionalAction, default=False, help="use dense rewards")
     parser.add_argument("-ad8", "--adam8", action=argparse.BooleanOptionalAction, default=False, help="use adam 8bit")
     parser.add_argument("-grad8", "--quant-gradient", action=argparse.BooleanOptionalAction, default=False, help="use 8bit gradient casting (fake quantization)")
     parser.add_argument("-adpath", "--adapter-path", default="", help="Path to lora adapter")
@@ -245,10 +220,10 @@ def main():
         """If 4bit quantized we need to add lora adapter"""
         new_model_name= f"{new_model_name}-quant-{args.qtype}"
         quant_config = get_quant_config(args.qtype)
-        # Set device map to cpu for very large models.
+        # Set device map to cpu for very large models. -- do NOT use with deepspeed 3 ; will get attribute/dtensor errors
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="cuda", 
+            # device_map="cpu", 
             quantization_config=quant_config,
             trust_remote_code=True,
         )
@@ -277,16 +252,24 @@ def main():
         # Set device map to cpu for very large models.
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            # device_map="auto", 
+            # device_map="cpu", 
             trust_remote_code=True,
         )
 
     os.environ["WANDB_PROJECT"]=args.wb_project
 
-    if args.qtype=="8bit":
-        for module in model.modules():
-            if isinstance(module, torch.nn.Linear):
-                module.register_forward_hook(quant_forward)
+    if args.qtype=="8bit" and not args.resume_from_checkpoint:
+        for name, module in model.named_modules():
+            if isinstance(module, QuantizedLinear):
+                continue
+            for child_name, child in module.named_children():
+                if child_name=="lm_head":
+                    continue
+                if isinstance(child, torch.nn.Linear):
+                    ql = QuantizedLinear(child.in_features, child.out_features, bias=(child.bias is not None))
+                    with torch.no_grad():
+                        ql.load_weights(child)
+                    setattr(module, child_name, ql)
                 
     if args.quant_gradient:
         assert args.qtype != "None" 
@@ -296,7 +279,7 @@ def main():
     
     training_args = get_train_args(new_model_name, args)
 
-    reward_fn = Reward(tokenizer, args.use_dense, False)
+    reward_fn = Reward(tokenizer, False)
 
     trainer = GRPOTrainer(
         model=model,
