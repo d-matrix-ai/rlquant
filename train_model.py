@@ -2,7 +2,7 @@ import os
 import torch
 from datasets import load_from_disk
 from datasets import DatasetDict
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, GenerationConfig
 from trl import GRPOTrainer, GRPOConfig, TrlParser, ModelConfig, get_peft_config
 from helper_functions import boxed_reward_fn
 
@@ -17,6 +17,17 @@ import torch
 
 from module import QuantizedLinear
 
+# Get the global process rank
+local_rank = int(os.environ.get('LOCAL_RANK',-1))
+seed = 42+local_rank
+print(seed)
+
+
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+#torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 class Reward:
     def __init__(self, tokenizer, use_dense, evaluate):
@@ -100,15 +111,21 @@ def load_data_for_train_and_eval(args):
 
 
 def get_train_args(new_model_name, args):
-    lr = 0.000001
-    if args.quantize and not args.qtype =="8bit":
-        lr=0.0001
+    lr = float(args.learning_rate)
+    #if args.quantize and not args.qtype =="8bit":
+    #    lr=0.0001
+    generation_kwargs = {
+            #"seed":seed,
+            "temperature":0.6,
+            "top_p":0.95,
+            "top_k":20,
+            "min_p":0}
     training_args = GRPOConfig(
         output_dir=f"./{new_model_name}",
         # auto_find_batch_size=True,        --- can't use with deepspeed 3
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=int(args.per_device_train_batch_size),
+        per_device_eval_batch_size=int(args.per_device_train_batch_size),
+        gradient_accumulation_steps=16,
         max_prompt_length=int(args.max_prompt_length),
         max_completion_length=int(args.max_completion_length),
         gradient_checkpointing=args.gc,
@@ -116,24 +133,24 @@ def get_train_args(new_model_name, args):
         logging_steps=int(args.logging_steps),
         eval_steps=int(args.eval_steps),
         num_train_epochs=1,
-        num_generations=8, 
+        num_generations=4, 
         save_total_limit=2,
         save_strategy='steps',
         eval_strategy='steps',
         max_grad_norm=1.0,
+     #   do_sample=True,
         beta=0,
         remove_unused_columns=False, 
         bf16=True,
         report_to="wandb",
         run_name=args.wb_run_name,
         save_steps=int(args.save_steps),
-        top_p=1,
-        temperature=1, 
+        generation_kwargs=generation_kwargs,
         lr_scheduler_type = "linear",
         logging_first_step=True,
         warmup_steps=1,
         loss_type="grpo",
-        eval_on_start=True,
+       # dispatch_batches=False,
     )
     if args.adam8:
         training_args.optim="adamw_8bit"
@@ -175,13 +192,14 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("-q", "--quantize", action=argparse.BooleanOptionalAction, default=False, help="Enable quantize")
-    
+    parser.add_argument("-lr", "--learning-rate", default=1e-6, help="learning rate")
+    parser.add_argument("-gt", "--grpo-temp", default=1.0, help="temperature passed to grpo algo")
     parser.add_argument("-mn", "--model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in model for finetuning")
-    parser.add_argument("-train-batch-size", "--per-device-train-batch-size", default=4, help="training batch size")
-    parser.add_argument("-eval-batch-size", "--per-device-eval-batch-size", default=4, help="evaluation batch size")
+    parser.add_argument("-train-batch-size", "--per-device-train-batch-size", default=1, help="training batch size")
+    parser.add_argument("-eval-batch-size", "--per-device-eval-batch-size", default=1, help="evaluation batch size")
     parser.add_argument("-bn", "--base-model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in base model for quantized evals")
     parser.add_argument("-nmn", "--new-model-name", default=f"Qwen3-0.6B-Base-ft", help="pass in model for finetuning")
-    parser.add_argument("-qt", "--qtype", default="4bit", help="Type of quantization. Options: [4bit, 8bit, None]")
+    parser.add_argument("-qt", "--qtype", default="4bit", help="Type of quantization. Options: [4bit, 8bit, 4bitSTE, None]")
     parser.add_argument("-wp", "--wb-project", default="CatchAllProject", help="wandb project name")
     parser.add_argument("-wr", "--wb-run-name", default="Placeholder", help="wandb run name")
     parser.add_argument("-lenp", "--max-prompt-length", default=512, help="prompt length for finetuning")
@@ -229,7 +247,7 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
 
-    if args.quantize and args.qtype != "8bit":
+    if args.quantize and args.qtype == "4bit":
         """If 4bit quantized we need to add lora adapter"""
         new_model_name= f"{new_model_name}-quant-{args.qtype}"
         quant_config = get_quant_config(args.qtype)
@@ -262,16 +280,16 @@ def main():
             model = get_peft_model(base_model, loraconf)
     else:
         """Load model as usual for supervised ft or 8bit quantized ft"""
-        # Set device map to cpu for very large models.
+        # Set device map to cpu for very large models -- do not use deepspeed 3 or you will get attribute/dtensor errors.
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            # device_map="auto", 
+            device_map="cpu", 
             trust_remote_code=True,
         )
 
     os.environ["WANDB_PROJECT"]=args.wb_project
 
-    if args.qtype=="8bit":
+    if args.qtype=="8bit" or args.qtype=="4bitSTE":
         for name, module in model.named_modules():
             if isinstance(module, QuantizedLinear):
                 continue
@@ -295,6 +313,9 @@ def main():
 
     reward_fn = Reward(tokenizer, args.use_dense, False)
 
+    #print("SAMPLE " + str(model.generation_config.do_sample))
+    #model.generation_config.do_sample = True
+        
     trainer = GRPOTrainer(
         model=model,
         args=training_args,
