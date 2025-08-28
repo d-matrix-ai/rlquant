@@ -151,6 +151,7 @@ def get_train_args(new_model_name, args):
         warmup_steps=1,
         loss_type="grpo",
        # dispatch_batches=False,
+        eval_on_start=True,
     )
     if args.adam8:
         training_args.optim="adamw_8bit"
