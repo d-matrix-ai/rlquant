@@ -193,6 +193,7 @@ def parse_arguments():
     parser.add_argument("-q", "--quantize", action=argparse.BooleanOptionalAction, default=False, help="Enable quantize")
     parser.add_argument("-lr", "--learning-rate", default=1e-6, help="learning rate")
     parser.add_argument("-gt", "--grpo-temp", default=1.0, help="temperature passed to grpo algo")
+    parser.add_argument("-et", "--eval-temp", default=0, help="temperature passed to eval")
     parser.add_argument("-mn", "--model-name", default="Qwen/Qwen3-0.6B-Base", help="pass in model for finetuning")
     parser.add_argument("-train-batch-size", "--per-device-train-batch-size", default=1, help="training batch size")
     parser.add_argument("-eval-batch-size", "--per-device-eval-batch-size", default=1, help="evaluation batch size")
@@ -227,6 +228,18 @@ def parse_arguments():
 
 
 def main():
+
+    # Get the global process rank
+    local_rank = int(os.environ.get('LOCAL_RANK',-1))
+    seed = 42+local_rank
+
+
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    #torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     args = parse_arguments()
 
