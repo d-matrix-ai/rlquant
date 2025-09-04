@@ -130,7 +130,7 @@ def get_train_args(new_model_name, args):
         learning_rate=lr,
         logging_steps=int(args.logging_steps),
         eval_steps=int(args.eval_steps),
-        num_train_epochs=4,
+        num_train_epochs=1,
         num_generations=4, 
         save_total_limit=2,
         save_strategy='steps',
