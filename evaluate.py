@@ -4,6 +4,8 @@ import argparse
 from datasets import load_from_disk
 from datasets import DatasetDict
 
+
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer 
 from transformers import BitsAndBytesConfig, GPTQConfig, Trainer
@@ -64,35 +66,30 @@ def get_ptq_config(ptq_type: str, tokenizer=None, gptq_data=None):
 
 def accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data):
     accelerator=Accelerator()
-    if args.quantize:                             
+    if args.quantize and args.qtype != "8bit":                             
         quant_config = get_quant_config(args.qtype)         
-        base_model = AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quant_config,
             trust_remote_code=True,
         )
-        base_model.config.use_cache = False
-        model = PeftModel.from_pretrained(base_model,args.adapter_path).to(device="cuda")
+        #base_model.config.use_cache = False
+        #model = PeftModel.from_pretrained(base_model,args.adapter_path).to(device="cuda")
         # model = p_model.merge_and_unload()
-<<<<<<< HEAD
+
     elif args.ptq:
-=======
-    else:
->>>>>>> main
         quant_config = get_ptq_config(args.ptq_type)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quant_config,
             trust_remote_code=True,
         )
-<<<<<<< HEAD
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             trust_remote_code=True,
         )
-=======
->>>>>>> main
+
     model.eval()
     
     AcceleratorState().deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 8
@@ -115,9 +112,9 @@ def accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data):
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
-                    max_new_tokens=512,
-                    do_sample=True,
-                    temperature=1.0,
+                    max_new_tokens=args.max_completion_length,
+                    do_sample=False,
+                    #temperature=1.0,
                     top_p=1.0,
                 )
             generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -132,22 +129,28 @@ def accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data):
         mean_reward = np.mean(np.array(all_scores))
         mean_stdev = np.std(np.array(all_scores))
         if accelerator.is_main_process:
-            print(f"eval/reward_{task}: {mean_reward},\n eval/std_{task}: {mean_stdev}")
-            wandb.log({"task": task, f"eval/reward_{task}": mean_reward, f"eval/std_{task}": mean_stdev})
+            print(f"eval_t0/reward_{task}: {mean_reward},\n eval_t0/std_{task}: {mean_stdev}")
+            wandb.log({"task": task, f"eval_t0/reward_{task}": mean_reward, f"eval_t0/std_{task}": mean_stdev})
     if accelerator.is_main_process:
-        print(f"eval/reward: {np.mean(np.array(data))},\n eval/std: {np.std(np.array(data))}")
-        wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.array(data))})
+        print(f"eval_t0/reward: {np.mean(np.array(data))},\n eval_t0/std: {np.std(np.array(data))}")
+        wandb.log({"eval_t0/reward": np.mean(np.array(data)), "eval_t0/reward_std": np.std(np.array(data))})
     print("Evaluation done!")
     
 
 
 def main():
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     args = parse_arguments()
 
     model_name = (args.base_model_name if args.quantize else args.model_name)
     adpath = args.adapter_path
     
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
 
@@ -159,7 +162,7 @@ def main():
 
     """Cannot use trainer with lora models, and evaluation is faster with vllm."""
     reward_fn = Reward(tokenizer, False, True)
-    if (args.ptq and args.ptq_type !="awq-4" and args.ptq_type !="awq-8") or args.quantize:
+    if False:
         """Cannot use vllm with lora models -- unless merging adapter into model, which worsens performance. Can use this with awq, but takes longer."""
         """When using accelerate launch script with `accelerate launch evaluate.py ...` """
         accelerate_evaluate(model_name, reward_fn, args, tokenizer, eval_data)
@@ -169,14 +172,16 @@ def main():
         if args.ptq:
             compressed_model= compress_model(args)
             model = LLM(compressed_model)
-        else:
+        elif args.quantize:
             print("=====================IN LOAD LLM==============================")
+            model = LLM(model_name, quantization="bitsandbytes")
+        else:
             model = LLM(args.model_name)
-        
         print("=====================MODEL LOADED==============================")
         wandb.init(project=args.wb_project, name= args.wb_run_name)
         tasks_list = ["aime", "amc", "math", "minerva", "olympiad_bench"]
         data=[]
+        #model.eval()
         for task in tasks_list:
             e_data = eval_data[task]
             inputs = []
@@ -184,7 +189,7 @@ def main():
             for item in e_data:
                 inputs.append(item["problem"])
                 answers.append(item["answer"])
-            sampling_params = SamplingParams(temperature=1.0,top_p=1.0, max_tokens=512)
+            sampling_params = SamplingParams(temperature=float(args.eval_temp), max_tokens=int(args.max_completion_length))
             outputs = model.generate(inputs, sampling_params)
             scores = []
             for i, output in enumerate(outputs):
@@ -196,10 +201,10 @@ def main():
             data.extend(scores)
             mean_reward = np.mean(np.array(scores))
             mean_stdev = np.std(np.array(scores))
-            print(f"eval/reward_{task}: {mean_reward},\n eval/std_{task}: {mean_stdev}")
-            wandb.log({"task": task, f"eval/reward_{task}": mean_reward, f"eval/std_{task}": mean_stdev})            
-        print(f"eval/reward: {np.mean(np.array(data))},\n eval/std: {np.std(np.array(data))}")
-        wandb.log({"eval/reward": np.mean(np.array(data)), "eval/reward_std": np.std(np.std(data))})
+            print(f"eval_t0/reward_{task}: {mean_reward},\n eval_t0/std_{task}: {mean_stdev}")
+            wandb.log({"task": task, f"eval_t0/reward_{task}": mean_reward, f"eval_t0/std_{task}": mean_stdev})            
+        print(f"eval_t0/reward: {np.mean(np.array(data))},\n eval_t0/std: {np.std(np.array(data))}")
+        wandb.log({"eval_t0/reward": np.mean(np.array(data)), "eval_t0/reward_std": np.std(np.std(data))})
         print("Evaluation done!")
 
 
