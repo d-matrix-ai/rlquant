@@ -116,10 +116,8 @@ def get_train_args(new_model_name, args):
     #    lr=0.0001
     generation_kwargs = {
             #"seed":seed,
-            "temperature":0.6,
-            "top_p":0.95,
-            "top_k":20,
-            "min_p":0}
+            "temperature":1.0,
+            "top_p":1.0}
     training_args = GRPOConfig(
         output_dir=f"./{new_model_name}",
         # auto_find_batch_size=True,        --- can't use with deepspeed 3
@@ -132,7 +130,7 @@ def get_train_args(new_model_name, args):
         learning_rate=lr,
         logging_steps=int(args.logging_steps),
         eval_steps=int(args.eval_steps),
-        num_train_epochs=1,
+        num_train_epochs=4,
         num_generations=4, 
         save_total_limit=2,
         save_strategy='steps',
@@ -151,7 +149,7 @@ def get_train_args(new_model_name, args):
         warmup_steps=1,
         loss_type="grpo",
        # dispatch_batches=False,
-        eval_on_start=True,
+        #seval_on_start=True,
     )
     if args.adam8:
         training_args.optim="adamw_8bit"
