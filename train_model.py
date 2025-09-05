@@ -123,7 +123,7 @@ def get_train_args(new_model_name, args):
         # auto_find_batch_size=True,        --- can't use with deepspeed 3
         per_device_train_batch_size=int(args.per_device_train_batch_size),
         per_device_eval_batch_size=int(args.per_device_train_batch_size),
-        gradient_accumulation_steps=16,
+        gradient_accumulation_steps=8,
         max_prompt_length=int(args.max_prompt_length),
         max_completion_length=int(args.max_completion_length),
         gradient_checkpointing=args.gc,
@@ -147,7 +147,7 @@ def get_train_args(new_model_name, args):
         lr_scheduler_type = "linear",
         logging_first_step=True,
         warmup_steps=1,
-        loss_type="grpo",
+        loss_type="dr_grpo" if args.drgrpo else "grpo",
        # dispatch_batches=False,
         #seval_on_start=True,
     )
@@ -158,7 +158,7 @@ def get_train_args(new_model_name, args):
         training_args.vllm_mode="colocate"
         training_args.vllm_gpu_memory_utilization=0.35
     if args.drgrpo:
-        training_args.scale_rewards = False
+        training_args.scale_rewards = 'none'
 
     return training_args
 
