@@ -189,7 +189,7 @@ def quant_grad(grad:torch.Tensor) -> torch.Tensor:
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-
+    parser.add_argument("-no-think", "--disable-think", action=argparse.BooleanOptionalAction, default=False, help="Enable thinking mode")
     parser.add_argument("-q", "--quantize", action=argparse.BooleanOptionalAction, default=False, help="Enable quantize")
     parser.add_argument("-lr", "--learning-rate", default=1e-6, help="learning rate")
     parser.add_argument("-gt", "--grpo-temp", default=1.0, help="temperature passed to grpo algo")
@@ -266,7 +266,7 @@ def main():
         # Set device map to cpu for very large models. -- do NOT use with deepspeed 3 ; will get attribute/dtensor errors
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="cuda", 
+            #device_map="cuda", 
             quantization_config=quant_config,
             trust_remote_code=True,
         )

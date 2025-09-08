@@ -190,6 +190,13 @@ def main():
                 inputs.append(item["problem"])
                 answers.append(item["answer"])
             sampling_params = SamplingParams(temperature=float(args.eval_temp), max_tokens=int(args.max_completion_length))
+            if args.disable_think:
+                inputs = [tokenizer.apply_chat_template(
+                    [{"role": "user", "content": inp}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,  # Set to False to strictly disable thinking
+                ) for inp in inputs]
             outputs = model.generate(inputs, sampling_params)
             scores = []
             for i, output in enumerate(outputs):
